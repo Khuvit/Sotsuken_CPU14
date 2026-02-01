@@ -1,16 +1,17 @@
 ================================================================================
+ここは RV32I.v ファイルでの具体的に変更をまとめてもらったファイルです。
+
+
 PIPELINE AND HAZARD HANDLING SPECIFICATION FOR CPU14
-RV32I 5-Stage Pipeline CPU - Minimal Correct Implementation
+RV32I 5-Stage Pipeline CPU - Implementation
 ================================================================================
 
  January 26, 2026
 Status: CPU12→CPU14 Enhancement Specification
 
 CORE PRINCIPLE:
-   CPU14 must be "fully functional" = no silent data corruption + hazards handled.
-   "Fully functional" ≠ "feature-complete" (skip nice-to-have ISA features).
-   
-   Focus: Correctness. Not: ISA completion (e.g., BNE, BLT, etc.).
+   no silent data corruption + hazards handled.
+   (SOME nice-to-have ISA features are missing).
 
 ================================================================================
 THREE ESSENTIAL ADDITIONS TO CPU12 (CPU14 Spec)

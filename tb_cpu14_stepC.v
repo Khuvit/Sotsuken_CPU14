@@ -2,7 +2,7 @@
 // tb_perf_compare_stepC.v
 // Performance-compare testbench for CPU12 vs CPU14 (cycle-based).
 //
-// How to use (example with iverilog):
+// 
 //  CPU12:
 //    iverilog -g2012 -o simC12.vvp tb_perf_compare_stepC.v rv32i.v i_mem.v d_mem.v reg.v alu.v defines.v
 //    vvp simC12.vvp
@@ -12,16 +12,15 @@
 //    vvp simC14.vvp
 //
 // Notes:
-// - This TB measures "cycles until PASS flag" (mem[0x08] == 1).
+// - TB measures "cycles until PASS flag" (mem[0x08] == 1).
 // - For CPU14, if the core exposes valid_W internally, we count retired instructions.
-// - Replace MEM/DATA init filenames + expected signatures to match your StepC program.
 
 module tb_perf_compare_stepC;
 
   // clock/reset
   reg clk = 0;
   reg rst_n = 0;
-  always #5 clk = ~clk;  // fixed period for fair comparison
+  always #5 clk = ~clk;
 
   initial begin
     rst_n = 0;
@@ -106,7 +105,6 @@ module tb_perf_compare_stepC;
   localparam integer TIMEOUT_CYCLES = 50000;
 
   // Signature addresses (example region)
-  // TODO: set these to whatever your StepC program writes.
   localparam [7:0] SIG0 = 8'h80;
   localparam [7:0] SIG1 = 8'h84;
   localparam [7:0] SIG2 = 8'h88;
@@ -162,14 +160,12 @@ module tb_perf_compare_stepC;
       $display("TIMEOUT after %0d cycles. PASS flag not observed.", TIMEOUT_CYCLES);
     end
 
-    // Signature checks
     $display("---- Signature checks ----");
     check_sig(SIG0, EXP0);
     check_sig(SIG1, EXP1);
     check_sig(SIG2, EXP2);
     check_sig(SIG3, EXP3);
 
-    // Performance report
     $display("---- Performance report ----");
     $display("Cycles_to_PASS = %0d", cyc);
 `ifdef CPU14
@@ -184,7 +180,6 @@ module tb_perf_compare_stepC;
     $display("Retired_instructions = N/A (CPU12 mode)");
 `endif
 
-    // Final verdict
     if (saw_pass && !fail) begin
       $display("TEST RESULT: PASS");
     end else if (!saw_pass && !fail) begin

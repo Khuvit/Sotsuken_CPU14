@@ -212,9 +212,9 @@ SIG  OK  @0x88: 0xccaa8866
 SIG  OK  @0x8c: 0x00000001
 ---- Performance report ----
 Cycles_to_PASS = 39
-Retired_instructions = 35
-CPI = 1.114286
-IPC = 0.897436
+Retired_instructions = 29
+CPI = 1.344828
+IPC = 0.743590
 TEST RESULT: PASS
 ```
 

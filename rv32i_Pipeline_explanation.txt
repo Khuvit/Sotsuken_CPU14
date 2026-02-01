@@ -1,0 +1,641 @@
+================================================================================
+                    RV32I PIPELINE CPU EXPLANATION
+================================================================================
+
+INTRODUCTION
+============
+
+This CPU implements a 5-stage pipeline. Instead of executing one instruction 
+at a time completely, it processes 5 instructions simultaneously, with each 
+instruction at a different pipeline stage. This greatly improves performance!
+
+The 5 Stages:
+  1. Fetch (F)    - Get instruction from memory
+  2. Decode (D)   - Figure out what the instruction does
+  3. Execute (E)  - Do the calculation
+  4. Memory (M)   - Access data memory (if needed)
+  5. Writeback (W)- Save result to register
+
+Each clock cycle, an instruction moves from one stage to the next. But pipelining
+has problems: data dependencies and control flow. This design handles them with:
+  - Hazard Detection (detects when stalling is needed)
+  - Data Forwarding (bypasses results from later stages to earlier ones)
+  - Stalling (pauses the pipeline when needed)
+  - Flushing (kills wrong-path instructions after branch/jump)
+
+
+================================================================================
+                     PART 1: PIPELINE CONTROL SIGNALS
+                           Lines 50-55
+================================================================================
+
+These signals control the "traffic flow" through your pipeline.
+
+VALID BITS (marked with suffix _D, _E, _M, _W):
+  valid_D: 1 = Decode stage has a real instruction, 0 = empty (bubble)
+  valid_E: 1 = Execute stage has a real instruction, 0 = empty
+  valid_M: 1 = Memory stage has a real instruction, 0 = empty
+  valid_W: 1 = Writeback stage has a real instruction, 0 = empty
+
+These track whether each stage contains a real instruction or just garbage data.
+When we need to stop an instruction (stall/flush), we insert a "bubble" by setting
+the valid bit to 0.
+
+CONTROL SIGNALS:
+  pc_write_en:    1 = allow PC to advance to next instruction, 0 = hold PC (stall)
+  ifid_write_en:  1 = allow IF/ID register to update, 0 = hold (stall)
+  stall_pipeline: 1 = pause the pipeline (usually due to load-use hazard)
+  flush_pipeline: 1 = kill instructions in flight (usually due to branch/jump)
+
+UNDERSTANDING STALL vs FLUSH:
+  
+  STALL: We detected a DATA HAZARD (load-use dependency)
+    - An instruction in Execute is a LOAD
+    - An instruction in Decode needs that LOAD's result
+    - Solution: Pause everything, wait for load to complete
+    - What happens: Insert bubbles, but don't kill instructions
+    - PC doesn't advance, instruction waits to retry
+  
+  FLUSH: We detected a CONTROL FLOW CHANGE (branch/jump taken)
+    - Instructions after branch are on the WRONG PATH
+    - They were speculatively fetched but shouldn't execute
+    - Solution: Kill them immediately with bubbles
+    - PC updates to branch target, instructions discarded
+
+
+================================================================================
+                  PART 2: FETCH STAGE PIPELINE REGISTERS
+                           Lines 68-92
+================================================================================
+
+The Fetch stage is the "gate" of the pipeline. It pulls instructions from 
+memory and feeds them into the Decode stage.
+
+KEY REGISTERS:
+  pc_reg:    Current Program Counter (8-bit address in this design)
+  inst:      Instruction bits being decoded in Decode stage
+  pc_D:      PC of the instruction in Decode stage
+  valid_D:   1 = instruction in Decode is valid, 0 = bubble
+
+HOW IT WORKS:
+
+Reset (when n_rst = 0):
+  All registers cleared to 0
+
+Normal Operation (pc_write_en = 1, ifid_write_en = 1, flush_pipeline = 0):
+  PC updates: pc_reg <= pc_next
+  IF/ID register latches new values:
+    inst <= instruction (from memory)
+    pc_D <= pc_reg (PC of this instruction)
+    valid_D <= 1 (mark as valid)
+  
+  After next clock, Decode stage sees the new instruction
+
+Stall (pc_write_en = 0 or ifid_write_en = 0):
+  pc_reg doesn't change (PC stays same)
+  IF/ID register doesn't change (holds previous instruction)
+  valid_D stays same
+  
+  Fetch is frozen; it waits for Decode to resolve the hazard
+
+Flush (flush_pipeline = 1):
+  valid_D <= 0 (insert bubble into Decode)
+  inst and pc_D hold (but become irrelevant since valid_D=0)
+  
+  When branch/jump is resolved in Execute, Fetch kills the 
+  speculative instructions that were fetched
+
+IMPORTANT CONCEPT: Non-blocking assignment (<=)
+  When you see: inst <= instruction
+  It means: "On the next clock edge, set inst to the value of instruction"
+  The assignment doesn't happen immediately—it waits for the clock edge.
+  This is how Verilog implements flip-flops.
+
+
+================================================================================
+                  PART 3: HAZARD DETECTION LOGIC
+                           Line 109
+================================================================================
+
+Not all instructions use the same operands. Some use rs1 and rs2, some use only rs1.
+This signal detects which instructions need BOTH source registers.
+
+Code:
+  wire id_rs2_used;
+  assign id_rs2_used = (opcode == `OP_OP) || 
+                       (opcode == `OP_STORE) || 
+                       (opcode == `OP_BRANCH);
+
+Meaning:
+  id_rs2_used = 1 if the instruction is:
+    - OP_OP:    R-type instruction (add, sub, and, etc.)
+                Uses rs1 (first operand) AND rs2 (second operand)
+    
+    - OP_STORE: Store instruction (sw, sh, sb)
+                Uses rs1 (base address) AND rs2 (data to store)
+    
+    - OP_BRANCH: Branch instruction (beq, bne, etc.)
+                Compares rs1 AND rs2
+  
+  id_rs2_used = 0 if the instruction is:
+    - OP_LOAD:  lw, lh, lb (uses only rs1 for address)
+    - OP_IMM:   addi, andi, etc. (uses only rs1)
+    - OP_JALR:  Jump (uses only rs1)
+    - OP_JAL:   Jump (doesn't use any registers)
+    - OP_LUI:   Load Upper Immediate (doesn't use registers)
+    - OP_AUIPC: Add Upper Immediate to PC (doesn't use registers)
+
+WHY THIS MATTERS:
+  The hazard detection logic later checks if a LOAD in Execute is writing to a 
+  register that Decode is READING. But if Decode's instruction doesn't use rs2, 
+  we should ignore whether rs2 matches. id_rs2_used prevents false stalls.
+  
+  Example without id_rs2_used:
+    lw x5, 0(x3)      // Load into x5
+    addi x6, x1, 10   // Add immediate (doesn't use x5)
+    
+    Hazard detector sees: rd_E = 5, rs2 = (undefined in addi)
+    If we checked "is rs2 = 5?", we'd get random results.
+    
+  Example with id_rs2_used:
+    Same code, but addi doesn't set id_rs2_used=1 (OP_IMM type)
+    So we never check rs2 match. No false stall!
+
+
+================================================================================
+            PART 4: DECODE TO EXECUTE PIPELINE REGISTER
+                        Lines 158-208
+================================================================================
+
+The ID/EX pipeline register is the largest. It captures ALL decoded instruction 
+information and holds it for the Execute stage.
+
+REGISTERS STORED:
+  rd_E:        Destination register number (which register to write result to)
+  rs1_E, rs2_E: Source register NUMBERS (indices, not values)
+  rdata_E1:    Value from source register 1 (from register file)
+  rdata_E2:    Value from source register 2 (from register file)
+  aluop_E:     ALU operation modifier bit
+  funct3_E:    Function code (3 bits, determines operation type)
+  imm_E:       Immediate value (sign-extended to 32 bits)
+  opcode_E:    Instruction opcode (7 bits)
+  pc_E:        Program Counter of this instruction
+  valid_E:     1 = valid instruction, 0 = bubble
+
+The "E" suffix means "in Execute stage"
+
+THREE OPERATIONAL MODES:
+
+Reset (n_rst = 0):
+  All registers set to 0, valid_E = 0 (no valid instruction)
+
+Flush Mode (flush_pipeline = 1):
+  ALL registers set to 0
+  valid_E = 0 (insert bubble)
+  This happens when a branch/jump is resolved in Execute.
+  Any instructions that were speculatively fetched after the branch
+  are killed and replaced with bubbles.
+
+Stall Mode (stall_pipeline = 1):
+  ALL registers (except pc_E) set to 0
+  valid_E = 0 (insert bubble)
+  pc_E <= pc_E (PC held, keeps alignment)
+  
+  Why insert a bubble? If Decode is stalled waiting for a load result,
+  we must not let Execute run an old instruction that might corrupt state.
+  The bubble does nothing—a perfect NOP.
+  
+  Why save pc_E? For alignment and potential recovery logic.
+
+Normal Operation (no stall, no flush):
+  All signals updated with current Decode-stage values:
+  
+  rdata_E1 <= rdata1      // Source reg 1 VALUE from register file
+  rdata_E2 <= rdata2      // Source reg 2 VALUE from register file
+  rd_E <= rd              // Destination reg NUMBER
+  rs1_E <= rs1            // Source reg 1 NUMBER
+  rs2_E <= rs2            // Source reg 2 NUMBER
+  funct3_E <= funct3      // Function bits
+  aluop_E <= aluop        // ALU control bit
+  opcode_E <= opcode      // Instruction type (7 bits)
+  imm_E <= imm_sel        // Selected immediate (based on opcode)
+  pc_E <= pc_D            // PC from Decode stage
+  valid_E <= valid_D      // Mark as valid if Decode had valid instruction
+
+WHY rs1_E AND rs2_E ARE PASSED:
+  These register NUMBERS (not values) are needed in later stages:
+  
+  1. FORWARDING: Execute needs to check "Is the result from Memory going 
+                 to x5? Am I trying to read x5?" If yes, forward the result.
+  
+  2. HAZARD DETECTION: Decode needs to check "Is Execute writing to a 
+                       register I need to read?" If yes, stall.
+
+Without rs1_E and rs2_E, later stages couldn't match operands to results.
+
+
+================================================================================
+              PART 5: DATA FORWARDING LOGIC
+                        Lines 242-260
+================================================================================
+
+This is the CLEVER part that prevents most stalls. Instead of waiting for a 
+result, we bypass it from a later stage directly to the ALU.
+
+THE PROBLEM:
+  Consider this code:
+    add x5, x1, x2      // x5 = x1 + x2
+    sub x6, x5, x3      // x6 = x5 - x3  ← needs x5 from previous instruction!
+  
+  Timeline:
+    Cycle 1: Fetch ADD
+    Cycle 2: Fetch SUB, Decode ADD
+    Cycle 3: Fetch next, Decode SUB, Execute ADD (result ready!)
+    Cycle 4: Execute SUB (but x5 not written yet!)
+    Cycle 5: Write x5 to register
+  
+  Without forwarding, Execute SUB would read the OLD x5 value from register 
+  file (before ADD wrote). WRONG ANSWER!
+
+THE SOLUTION: Forward (bypass)
+
+Code:
+  wire [DATA_W-1:0] wb_result = (opcode_W == `OP_LOAD) ? rd_data_W : alu_res_W;
+  
+  assign rs1_fwd = (rd_M != 0 && rd_M == rs1_E) ? alu_res_M :
+                   (rd_W != 0 && rd_W == rs1_E) ? wb_result : rdata_E1;
+  
+  assign rs2_fwd = (rd_M != 0 && rd_M == rs2_E) ? alu_res_M :
+                   (rd_W != 0 && rd_W == rs2_E) ? wb_result : rdata_E2;
+
+Translation:
+  "For rs1 operand, check (in priority order):
+    1. Is Memory stage writing to rs1_E? If yes, use that result (alu_res_M)
+    2. Else, is Writeback stage writing to rs1_E? If yes, use that result
+       (rd_data_W for loads, alu_res_W for other instructions)
+    3. Else, use the normal register file value (rdata_E1)"
+
+KEY DETAIL: rd_M != 0 and rd_W != 0
+  Register x0 (zero register) is special—you can't hold data in it.
+  So we only forward if the destination register is NOT x0.
+  If rd_M = 0, that instruction doesn't actually write anything.
+
+EXAMPLE WITH FORWARDING:
+  add x5, x1, x2      // Execute: computes x5 = x1 + x2, stores in alu_res_M
+  sub x6, x5, x3      // Execute: 
+                      //   Check: is rd_M == rs1_E? (5 == 5? YES!)
+                      //   Use rs1_fwd = alu_res_M (the ADD result)
+                      //   Can execute immediately without stall!
+
+JUMP/BRANCH SIGNALS:
+  assign is_jal_E  = (opcode_E == `OP_JAL);
+  assign is_jalr_E = (opcode_E == `OP_JALR);
+
+These identify control flow instructions in Execute stage:
+  - JAL:  Jump And Link (unconditional jump, saves return address)
+  - JALR: Jump And Link Register (jump to register, saves return address)
+
+These signals trigger a FLUSH because the next PC is determined in Execute,
+and we need to invalidate any speculatively fetched instructions that assumed
+sequential execution.
+
+
+================================================================================
+              PART 6: EXECUTE TO MEMORY PIPELINE REGISTER
+                        Lines 284-308
+================================================================================
+
+This register passes results from Execute to Memory stage. Simpler than ID/EX.
+
+WHAT GETS PASSED:
+  alu_res_M:   ALU result (used as address for load/store)
+  rd_M:        Destination register (will be written in Writeback)
+  funct3_M:    Function code (determines load/store size: byte/half/word)
+  opcode_M:    Instruction type (tells Memory what to do)
+  rdata_M1:    Source reg 1 value (kept for reference)
+  rdata_M2:    Source reg 2 value (kept for reference)
+  pc_M:        Instruction's PC
+  valid_M:     Valid bit (propagates forward)
+  store_data_M: Data to store in memory (special!)
+
+The "M" suffix means "in Memory stage"
+
+THE SPECIAL ONE: store_data_M
+
+  assign store_data_M <= rs2_fwd;
+
+For STORE instructions, rs2 holds the DATA TO WRITE to memory.
+
+But we don't use the raw rdata_E2! We use rs2_fwd—the FORWARDED version.
+
+WHY FORWARD HERE?
+  Example:
+    add x5, x1, x2       // x5 = result
+    sw x5, 0(x6)         // store x5 to memory
+  
+  Timeline:
+    Cycle 1: Fetch ADD
+    Cycle 2: Fetch SW, Decode ADD
+    Cycle 3: Fetch next, Decode SW, Execute ADD (alu_res_M = result)
+    Cycle 4: Memory of SW: needs x5 value!
+  
+  In cycle 4, sw is in Memory, add is in Writeback.
+  rs2_fwd checks: "Is rd_M == x5?" (the recent ADD result)
+  If yes, use alu_res_M (the ADD result)
+  
+  Memory stage gets the right data immediately, no extra stall needed!
+
+Without forwarding at store, we'd need additional stalls for stores that
+depend on recent instructions. Forwarding the store data avoids this.
+
+NO FLUSH/STALL LOGIC:
+  EX/MEM register doesn't have special stall/flush logic because:
+  - If hazard exists, it was handled in earlier stages (stall in Decode
+    or forward in Execute)
+  - Once instruction reaches Memory, it completes its memory operation
+    and moves on to Writeback
+
+
+================================================================================
+              PART 7: MEMORY TO WRITEBACK PIPELINE REGISTER
+                        Lines 348-355
+================================================================================
+
+The simplest pipeline register. It just passes results from Memory to 
+Writeback for the final register write.
+
+WHAT GETS PASSED:
+  opcode_W:    Instruction type (determines which result to write)
+  rd_data_W:   Data read from memory (for LOAD instructions)
+  rd_W:        Destination register (which register to write)
+  alu_res_W:   ALU result (for arithmetic/logic instructions)
+  pc_W:        Instruction's PC (used for JAL/JALR return address)
+  valid_W:     Valid bit (only write if valid)
+
+The "W" suffix means "in Writeback stage"
+
+NO FLUSH OR STALL LOGIC:
+  This register is passive—no special control flow handling.
+  
+  Why? Because by the time instruction reaches Writeback:
+  - All hazards were resolved (stall in Decode or forward in Execute)
+  - Control flow was determined (flush in Execute if needed)
+  - Instruction is committed and will definitely write its result
+
+
+================================================================================
+              PART 8: WRITEBACK STAGE LOGIC
+                        Lines 365-377
+================================================================================
+
+The final stage. Decides WHAT DATA to write and WHERE to write it.
+
+CALCULATE RETURN ADDRESS FOR JUMPS:
+  assign jal_link = pc_W + 32'd4;
+
+For JAL and JALR instructions (jump-and-link), we need to save the return 
+address so the program can return after the jumped-to function completes.
+
+Return address = Current instruction's PC + 4 (size of instruction)
+
+Example:
+  PC = 0x100: jal x1, func_target   // Jump to function, save return in x1
+  
+  Execute stage sets jal_link = 0x100 + 4 = 0x104
+  Writeback saves 0x104 to x1
+  When function returns, PC is set to x1 (0x104)—back to next instruction!
+
+MULTIPLEX WRITE DATA (which result to write):
+  assign wd = (opcode_W == `OP_LOAD) ? rd_data_W :
+              (opcode_W == `OP_OP   || opcode_W == `OP_IMM ||
+               opcode_W == `OP_AUIPC || opcode_W == `OP_LUI) ? alu_res_W :
+              (opcode_W == `OP_JAL  || opcode_W == `OP_JALR) ? jal_link :
+              rd_data_W;
+
+Based on instruction type, choose source of data to write:
+
+  LOAD instructions (lw, lh, lb):
+    Write data that was READ from memory
+    wd = rd_data_W
+
+  Arithmetic/Logic instructions (OP: add, sub, and, etc.):
+    Write result from ALU
+    wd = alu_res_W
+
+  Immediate instructions (OP_IMM: addi, andi, etc.):
+    Write result from ALU
+    wd = alu_res_W
+
+  AUIPC (Add Upper Immediate to PC):
+    Write result from ALU (PC + immediate)
+    wd = alu_res_W
+
+  LUI (Load Upper Immediate):
+    Write result from ALU (immediate in upper 20 bits)
+    wd = alu_res_W
+
+  Jump instructions (JAL, JALR):
+    Write return address (PC + 4)
+    wd = jal_link
+
+  Default:
+    wd = rd_data_W (fallback)
+
+WRITE ENABLE SIGNAL (r_we):
+  assign r_we = valid_W && (
+                (opcode_W == `OP_LOAD)  || (opcode_W == `OP_OP)   ||
+                (opcode_W == `OP_IMM)   || (opcode_W == `OP_JAL)  ||
+                (opcode_W == `OP_JALR)  || (opcode_W == `OP_LUI)  ||
+                (opcode_W == `OP_AUIPC));
+
+Write is enabled ONLY if BOTH:
+  1. valid_W = 1 (instruction is real, not a bubble)
+  2. AND instruction type WRITES a register
+
+Instructions that DON'T write to registers:
+  STORE (sw, sh, sb): Writes to memory, not register
+  BRANCH (beq, bne): Updates PC, but doesn't write a register
+  
+When r_we = 1:
+  Register file receives:
+    .a3(rd_W)     ← which register to write
+    .wd(wd)       ← what data to write
+    .we(r_we)     ← write enable (1)
+  
+  Result: wd is stored in register rd_W
+
+
+================================================================================
+                       COMPLETE EXAMPLE
+================================================================================
+
+Let's trace an ADD instruction through the entire pipeline:
+
+Instruction: add x5, x3, x7   (x5 = x3 + x7)
+
+---CYCLE 1---
+  F: Fetch from PC=0, get ADD instruction
+     pc_reg = 0 → pc_next = 4
+  D: (empty)
+  E: (empty)
+  M: (empty)
+  W: (empty)
+
+---CYCLE 2---
+  F: Fetch from PC=4, instruction in IF/ID
+     inst <= instruction (ADD bits)
+     pc_D <= 0
+     valid_D <= 1
+  D: Decode ADD
+     opcode = OP_OP
+     rs1 = 3, rs2 = 7, rd = 5
+     rdata1 = value in x3
+     rdata2 = value in x7
+  E: (empty)
+  M: (empty)
+  W: (empty)
+
+---CYCLE 3---
+  F: Fetch from PC=8
+  D: Decode next instruction
+  E: Execute ADD
+     rs1_fwd = rdata_E1 = x3 value (no forwarding needed, fresh from regfile)
+     rs2_fwd = rdata_E2 = x7 value
+     ALU: alu_res = rs1_fwd + rs2_fwd
+     alu_res_M = ALU result
+  M: (empty)
+  W: (empty)
+
+---CYCLE 4---
+  F: Fetch from PC=12
+  D: Decode another instruction
+  E: Execute the next instruction
+  M: Memory stage of ADD
+     (nothing to do—ADD doesn't access memory)
+  W: (empty)
+
+---CYCLE 5---
+  F: Fetch from PC=16
+  D: Decode another instruction
+  E: Execute another instruction
+  M: Execute another instruction
+  W: Writeback ADD
+     opcode_W = OP_OP
+     wd selector: choose alu_res_W (the sum)
+     r_we = 1 (valid_W = 1 and it's an OP type)
+     Register x5 is written with the sum value
+     ✅ RESULT COMMITTED
+
+Total: 5 cycles from fetch to writeback. Meanwhile, 4 other instructions 
+are also in flight at various stages.
+
+
+================================================================================
+                    KEY PIPELINE CONCEPTS
+================================================================================
+
+HAZARDS AND SOLUTIONS:
+
+1. DATA HAZARD - Read After Write (RAW):
+   Problem: Instruction reads register that previous instruction just wrote
+   Solution 1: Forwarding (bypass result from later stage to Execute ALU)
+   Solution 2: Stalling (wait for result to be written)
+   
+   Example: add x5, ... / sub x6, x5, ...
+   Forwarding path: Execute ADD result → Execute SUB input (no stall)
+
+2. CONTROL HAZARD - Branch/Jump:
+   Problem: Don't know next PC until Execute stage resolves the branch
+   Solution 1: Predict (fetch sequentially, flush if wrong)
+   Solution 2: Flush pipeline when branch is resolved
+   
+   This design uses prediction (fetch next sequential). When branch is 
+   resolved in Execute, if taken, it flushes wrong-path instructions.
+
+3. STRUCTURAL HAZARD - Resource Conflict:
+   This design avoids structural hazards by having separate instruction 
+   and data memories.
+
+BUBBLES:
+  A "bubble" is an empty pipeline stage (valid_* = 0). It does nothing 
+  and wastes a cycle, but prevents errors.
+  
+  Inserted by:
+  - Stall (valid bit cleared when data hazard detected)
+  - Flush (valid bit cleared when control flow changed)
+  - Reset (all valid bits cleared)
+
+FORWARDING PRIORITY:
+  Results flow backward through the pipeline (early stages get results 
+  from later stages). Priority:
+  
+  1. Memory stage result (most recent)
+  2. Writeback stage result
+  3. Register file (original value)
+
+VALID BITS PROPAGATE:
+  As instruction moves through pipeline, valid bit follows:
+  valid_D → valid_E → valid_M → valid_W
+  
+  If valid bit is 0, that stage does nothing (bubble passed through).
+
+PC UPDATES EARLY:
+  PC is updated in Fetch stage based on signals from Execute stage 
+  (branch_taken_E, is_jal_E, is_jalr_E). This allows the next fetch 
+  to get the correct instruction even if a branch was taken.
+
+
+================================================================================
+                      REGISTER FILE INTERACTIONS
+================================================================================
+
+The register file is a dual-read, single-write memory:
+
+READS (combinational, in Decode stage):
+  Address: rs1, rs2 (decoded from instruction bits)
+  Output: rdata1, rdata2 (values of x[rs1], x[rs2])
+  
+  These happen immediately—no waiting required.
+  These values might be stale if a recent instruction is about to 
+  write the same register (hazard!).
+
+WRITES (sequential, in Writeback stage):
+  Address: rd_W (destination register from pipeline)
+  Data: wd (from Writeback stage mux)
+  Enable: r_we (only write if this signals is 1)
+  
+  On clock edge, if r_we = 1:
+    x[rd_W] = wd
+  
+  This is why forwarding is needed—newer data is in the pipeline, 
+  not yet in the register file.
+
+
+================================================================================
+                       SUMMARY
+================================================================================
+
+The RV32I pipeline is a carefully orchestrated dance of 5 stages:
+
+1. FETCH: Pulls instruction from memory, feeds Decode
+2. DECODE: Extracts operands, reads register file, detects hazards
+3. EXECUTE: Computes ALU result, determines next PC, forwards results back
+4. MEMORY: Accesses memory for load/store, passes result forward
+5. WRITEBACK: Selects result based on instruction type, writes to register file
+
+Control signals (stall/flush) prevent errors from data and control dependencies.
+Valid bits track whether each stage has real instruction or a bubble.
+Forwarding bypasses results from later stages to execute stage to minimize stalls.
+
+When everything works correctly, the pipeline executes one instruction per clock 
+cycle (throughput of 1.0), with about 5 cycles latency from fetch to writeback.
+
+When hazards occur:
+  - Data hazards: Handled by stalling or forwarding
+  - Control hazards: Handled by flushing on misprediction
+  - Bubbles are inserted to maintain correctness
+
+This design successfully demonstrates a modern pipelined processor with hazard 
+handling, making it a great learning tool for understanding CPU architecture!
+
+================================================================================

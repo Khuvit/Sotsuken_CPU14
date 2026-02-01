@@ -1,0 +1,318 @@
+================================================================================
+PIPELINE AND HAZARD HANDLING SPECIFICATION FOR CPU14
+RV32I 5-Stage Pipeline CPU - Minimal Correct Implementation
+================================================================================
+
+ January 26, 2026
+Status: CPU12→CPU14 Enhancement Specification
+
+CORE PRINCIPLE:
+   CPU14 must be "fully functional" = no silent data corruption + hazards handled.
+   "Fully functional" ≠ "feature-complete" (skip nice-to-have ISA features).
+   
+   Focus: Correctness. Not: ISA completion (e.g., BNE, BLT, etc.).
+
+================================================================================
+THREE ESSENTIAL ADDITIONS TO CPU12 (CPU14 Spec)
+================================================================================
+
+1. ADD MEM/WB → ALU FORWARDING (Second bypass path)
+   ─────────────────────────────────────────────────
+   Why: Without it, stalls are longer than needed.
+   
+   Example where Path 1 (EX/MEM) alone is insufficient:
+      Cycle 1: ADD x1, x2, x3      (EX) → writes x1
+      Cycle 2: ADD x4, x1, x5      (EX, using forwarded x1 from EX/MEM)
+      Cycle 3: ADD x7, x4, x6      (EX) ← x4 is in MEM/WB, not EX/MEM!
+                                        If no Path 2, must stall here.
+   
+   With Path 2: x4 forwarded from MEM/WB → no stall.
+   
+   Implementation:
+         Forwarding mux priority: EX/MEM > MEM/WB > regfile
+         // Compare older destinations against sources of the instruction in EX
+         if (EX/MEM.rd == ID/EX.rs1 && EX/MEM.rd != 0)
+            in_a ← EX/MEM.alu_res_M;  // highest priority
+         else if (MEM/WB.rd == ID/EX.rs1 && MEM/WB.rd != 0)
+            in_a ← MEM/WB.alu_res_W;  // lower priority
+         else
+            in_a ← regfile_read(ID/EX.rs1);  // default
+
+2. ADD STORE-DATA FORWARDING (To SW instruction)
+   ─────────────────────────────────────────────
+   Why: CRITICAL - prevents silent data corruption.
+   
+   Example of bug without store-data forwarding:
+      Cycle 1: ADD x1, x2, x3      (EX) → x1 ← result
+      Cycle 2: SW x1, 4(x0)         (EX) ← reads OLD x1 from regfile
+      Cycle 3: LW x4, 4(x0)         (EX) → x4 ← stale data written
+      
+      Result: x4 is wrong. Program runs, no crash, data silently corrupted.
+              This is the WORST kind of bug.
+   
+   With store-data forwarding:
+      Cycle 2: SW x1, 4(x0) → forwards EX/MEM.alu_res_M to memory write
+      Cycle 3: LW x4, 4(x0) → reads correct data
+   
+   Implementation (EX stage, carried through to MEM):
+      In Execute stage (when SW is in EX):
+         store_data_EX ←
+            (EX/MEM.rd == ID/EX.rs2 && EX/MEM.rd != 0) ? EX/MEM.alu_res_M :
+            (MEM/WB.rd  == ID/EX.rs2 && MEM/WB.rd  != 0) ? MEM/WB.result    :
+            rdata_E2;  // default from regfile
+
+      Carry `store_data_EX` into EX/MEM latch, then:
+         In Memory stage: d_out ← store_data_EX
+
+3. MOVE BRANCH/JALR RESOLUTION TO EXECUTE STAGE
+   ─────────────────────────────────────────────
+   Why: Eliminates correctness trap; reuses existing forwarding.
+   
+   Problem with Decode-stage branch/JAL (current CPU12):
+      - Decode sees branch instruction but NOT forwarding paths
+      - If branch depends on forwarded data, branch sees stale operands
+      - Example: ADD x1, x2, x3 / BEQ x1, x0, +8
+        Decode-stage BEQ sees OLD x1 → wrong decision
+   
+   Solution: Move to EX
+      - Branch in EX can use same forwarding as ALU
+      - Reuse EX/MEM and MEM/WB forwarding paths
+      - Flush happens same stage as ALU (consistent)
+      - Compute pc_next from EX stage only
+   
+   Changes:
+      1. Remove early jump detection from Decode (is_jal_D, is_jalr_D)
+      2. Add branch comparator to Execute stage
+      3. Resolve branch_taken in EX like ALU result; same for JAL/JALR taken
+      4. On taken branch/jump: IFID_flush = 1 and IDEX_flush = 1
+   
+   Trade-off: 1 extra misprediction cycle vs. Decode-stage
+              (branch penalty goes from ~0 to ~1; acceptable for correctness)
+
+================================================================================
+SUPPORTING INFRASTRUCTURE (Already spec'd, implement these)
+================================================================================
+
+Load-Use Stall Mechanism
+────────────────────────
+   Hazard Detection:
+      if (EX.memRead && EX.rd != 0 &&
+          (EX.rd == ID.rs1 || (ID.rs2_used && EX.rd == ID.rs2)))
+         stall = 1
+   
+   Stall Action (selective, non-deadlocking):
+      - PCWrite = 0        (freeze PC; no increment)
+      - IFID_write = 0     (freeze IF/ID; hold current instruction)
+      - IDEX_flush = 1     (insert bubble into ID/EX: opcode=0, valid=0)
+      - Allow EX/MEM/WB to proceed (load progresses)
+
+Flush/Kill Logic
+────────────────
+   Add valid bit to each stage latch.
+   
+   On branch taken in EX:
+      - valid_IF_ID ≤ 0   (kill IF/ID)
+      - valid_ID_EX ≤ 0   (kill ID/EX)
+      - valid_EX_MEM and later: unchanged (on correct path)
+   
+   Killed instructions become bubbles (NOP) and MUST NOT perform side effects:
+       - When valid=0, force control signals low: RegWrite=0, MemWrite=0, etc.
+       - Prevent any register or memory write when valid=0
+
+   Control-disable rule (mandatory):
+      Derive effective control signals by AND-ing with the stage valid bit:
+         RegWrite_eff = RegWrite & valid_stage
+         MemWrite_eff = MemWrite & valid_stage
+         MemRead_eff  = MemRead  & valid_stage
+         Branch_eff   = Branch   & valid_stage
+      Use effective signals to guard all writes and side effects.
+
+x0 Special Case
+───────────────
+   Check (rd != 0) in ALL forwarding, stall, flush logic.
+   x0 is hardwired to 0; never forward to/from it.
+
+================================================================================
+WHAT TO SKIP (For CPU14 scope)
+================================================================================
+
+✗ All 6 branch types (BNE, BLT, BGE, BLTU, BGEU)
+  Keep: BEQ only (sufficient to prove branch hazard handling)
+  
+✗ Branch prediction
+  Not needed; acceptable to have 1-cycle penalty
+  
+✗ Exception/trap handling
+  Out of scope for CPU14
+  
+✗ Load variants (LB, LH, LBU, LHU)
+  Keep: LW only (proves load-use hazard)
+  
+✗ Store variants (SB, SH)
+  Keep: SW only (proves store-data forwarding)
+  
+✗ ADDI, ALU immediate variants beyond what CPU12 has
+  Keep minimal: just enough for test programs
+  
+✗ Multi-cycle operations (multiply, divide)
+  Not needed
+
+================================================================================
+IMPLEMENTATION CHECKLIST FOR CPU14
+================================================================================
+
+Hazard Detection Unit (HDU)
+   [ ] Detect load-use: EX.memRead && (EX.rd == ID.rs1 || ID.rs2 if used) && rd!=0
+   [ ] Output stall_pipeline signal
+
+Stall Mechanism
+   [ ] Freeze PC: if (stall) pc_next ≤ pc_reg
+   [ ] Freeze IF/ID: if (stall) IF_ID ≤ IF_ID
+   [ ] Bubble injection: if (stall) inject opcode=0, valid=0 into ID/EX
+   [ ] Let EX/MEM/WB proceed (no freeze)
+
+Forwarding Path 1: EX/MEM → ALU
+   [ ] Mux in ALU input (in_a, in_b)
+   [ ] if (EX/MEM.rd == ID/EX.rs1 && EX/MEM.rd!=0) forward alu_res_M → in_a
+   [ ] if (EX/MEM.rd == ID/EX.rs2 && EX/MEM.rd!=0 && rs2 used) forward → in_b
+   [ ] Test with ALU-ALU consecutive instructions
+
+Forwarding Path 2: MEM/WB → ALU
+   [ ] Add lower-priority mux layer
+   [ ] if (MEM/WB.rd == ID/EX.rs1 && MEM/WB.rd!=0 && !Path1) forward alu_res_W → in_a
+   [ ] if (MEM/WB.rd == ID/EX.rs2 && MEM/WB.rd!=0 && rs2 used && !Path1) forward → in_b
+   [ ] Test with NOP between ALU instructions
+
+   NOTE (Correctness): Treat MEM/WB forwarding as correctness-required.
+      If regfile is not write-first (write visible before read in same cycle),
+      some RAW cases will read stale data without MEM/WB bypass.
+
+ Store-Data Forwarding (EX stage, carried to MEM)
+    [ ] Detect SW instruction in Execute stage
+    [ ] Compute store_data_EX via forwarding from EX/MEM or MEM/WB
+        (EX/MEM.rd == ID/EX.rs2) or (MEM/WB.rd == ID/EX.rs2), ignoring rd==0
+    [ ] Latch store_data_EX into EX/MEM; in MEM, drive d_out ← store_data_EX
+    [ ] Test: ADD → SW → LW sequence
+
+Move Branch to Execute
+   [ ] Remove Decode-stage branch detection (is_jal_D, is_jalr_D)
+   [ ] Add branch comparator to EX stage (only BEQ for now)
+   [ ] branch_taken = (rdata_E1 == rdata_E2) && (is_branch_E)
+   [ ] Forward operands to comparator using EX/MEM + MEM/WB paths
+   [ ] Connect branch_taken to flush logic
+
+Flush/Kill Logic
+   [ ] Add valid bit to IF_ID, ID_EX, EX_MEM, MEM_WB latches
+   [ ] On branch taken (branch_taken_E == 1):
+      - valid_IF_ID ≤ 0
+      - valid_ID_EX ≤ 0
+      - Update PC to branch target
+   [ ] Instructions with valid=0 don't write registers/memory
+
+Priority: Stall vs. Flush
+   [ ] if (flush_pipeline) valid_D_EX ≤ 0;  // flush priority
+       else if (stall_pipeline) pc_hold ≤ 1;
+
+================================================================================
+TEST PROGRAMS FOR CPU14 (Essential validation)
+================================================================================
+
+Test 1: ALU-ALU Forwarding (Path 1, no stall)
+────────────────────────────────────────────
+   ADD x1, x2, x3
+   ADD x4, x1, x5       ← x1 forwarded from EX/MEM
+   ADD x6, x4, x7       ← x4 forwarded from EX/MEM
+   
+   Expected: All computations correct, no stalls
+   Verification: x1, x4, x6 contain correct values
+
+Test 2: Load-Use Stall
+──────────────────────
+   LW x1, 0(x0)         ← loads 0xDEADBEEF from mem[0]
+   ADD x2, x1, x3       ← dependent on LW, stalls 1 cycle
+   ADD x4, x2, x5       ← depends on ADD
+   
+   Expected: LW executes, stall on ADD (bubble in EX), then forward x1 to ADD
+   Verification: x2 = x1 + x3; x4 = x2 + x5 (both correct)
+   Trace: Should see valid=0 (bubble) in Execute stage during stall
+
+Test 3: Store-Data Forwarding
+──────────────────────────────
+   ADD x1, x2, x3       ← result: 0x11223344
+   SW x1, 4(x0)         ← stores x1 (forwarded) to mem[4]
+   LW x5, 4(x0)         ← reads mem[4] back
+   
+   Expected: SW writes 0x11223344; LW reads 0x11223344
+   Verification: mem[4] = 0x11223344; x5 = 0x11223344
+   Why important: Proves store-data forwarding works; no silent data corruption
+
+Test 4: Integration (Combined hazards; CPU14 includes ADDI and JAL support)
+──────────────────────────────────────
+   LW x1, 0(x0)         ← load 0x11223344
+   ADDI x2, x1, 0       ← x2 ← x1 (load-use dependency)
+   BEQ x1, x2, pass     ← branch compares (forwarded operands)
+   ADDI x3, x0, 0       ← x3 = 0 (FAIL path, will be flushed)
+   SW x3, 8(x0)         ← write 0
+   JAL x0, end
+   pass:
+   ADDI x3, x0, 1       ← x3 = 1 (PASS path)
+   SW x3, 8(x0)         ← write 1
+   end:
+   JAL x0, end          ← infinite loop
+   
+   Expected: PASS (mem[8] = 1)
+   Verification: mem[8] = 0x00000001
+   Complex scenario: load-use, branch/JALR decision in EX, flush with valid=0 control-disable,
+                     ALU forwarding (EX/MEM + MEM/WB) and store-data forwarding
+
+================================================================================
+SCOPE AND EFFORT ESTIMATE
+================================================================================
+
+Feature                        | Lines of Code | Time Estimate | Risk
+───────────────────────────────|───────────────|───────────────|──────────
+HDU + stall mechanism          | ~50-100       | 3-5 days      | Low
+Forwarding Path 1 (EX/MEM)     | ~40-60        | 2-3 days      | Low
+Forwarding Path 2 (MEM/WB)     | ~20-30        | 1-2 days      | Low
+Store-data forwarding          | ~30-50        | 2-3 days      | Medium
+Move branch to EX              | ~80-120       | 4-5 days      | Medium
+Flush/kill logic               | ~50-80        | 3-4 days      | Medium
+Valid bits (all stages)        | ~30-50        | 1-2 days      | Low
+Testing & debugging            | varies        | 2-3 weeks     | High
+
+Total: ~6-8 weeks (2-month project) ✓ Realistic for school
+
+================================================================================
+DEFINITION: "FULLY FUNCTIONAL" CPU14
+================================================================================
+
+After implementing the 3 essential items + supporting infrastructure, CPU14 is
+"fully functional" if it satisfies:
+
+✓ No silent data corruption (store-data forward prevents this)
+✓ Load-use hazards stalled correctly (1 cycle max)
+✓ ALU-ALU forwarding works (minimizes stalls)
+✓ Branch hazards flushed correctly (valid bits)
+✓ Branch operands forwarded (moved to EX)
+✓ x0 special-cased everywhere
+✓ All 4 tests pass
+
+It is NOT "ISA-complete" (missing BNE, BLT, etc.) but IS "hazard-complete"
+for the instructions you support.
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+1. Implement checklist items in order
+2. Add valid bits first (easy, unblocks stall/flush)
+3. Add HDU + stall mechanism (core hazard handling)
+4. Add forwarding paths (low risk, high impact)
+5. Add store-data forwarding (prevents corruption bug)
+6. Move branch to EX (higher risk, but correctness critical)
+7. Run tests 1-4, debug
+8. Celebrate CPU14 completion ✓
+
+================================================================================
+END OF CPU14 SPECIFICATION
+================================================================================

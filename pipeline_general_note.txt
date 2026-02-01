@@ -1,0 +1,8 @@
+structural hazard:
+1 memory with 1 read/port cannot handle cannot handle Memory access and Memory fetch at the same time, so more like structural/design hazard
+(SO we delay 3rd instru 1 cycle)
+
+Data hazard:
+
+intsru Decode cycle wants to read reg value, but previous instru handling that reg value cannot be update at the time. So read the old value.
+so we use bypassing or forwarding So the pipeline register(urt nariin box) can send the value using special data path to next instru ALU.
